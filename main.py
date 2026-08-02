@@ -1,4 +1,4 @@
-import os, re, base64, time, datetime, sqlite3
+import os, re, base64, time, datetime, sqlite3, json
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -9,17 +9,15 @@ DB = "fuel.db"
 
 def init_db():
     con=sqlite3.connect(DB)
-    con.execute("CREATE TABLE IF NOT EXISTS fuel (user_id INTEGER, date TEXT, gallons REAL, disc REAL, saving REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS fuel (user_id INTEGER, date TEXT, gallons REAL, disc REAL, saving REAL, location TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, chat_id INTEGER)")
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-def add_fuel(user_id, gallons, disc, saving):
+def add_fuel(user_id, gallons, disc, saving, loc=""):
     con=sqlite3.connect(DB)
     date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    con.execute("INSERT INTO fuel VALUES (?,?,?,?,?)", (user_id, date, gallons, disc, saving))
-    con.commit()
-    con.close()
+    con.execute("INSERT INTO fuel VALUES (?,?,?,?,?,?)", (user_id, date, gallons, disc, saving, loc))
+    con.commit(); con.close()
 
 def get_weekly(user_id):
     con=sqlite3.connect(DB)
@@ -29,124 +27,141 @@ def get_weekly(user_id):
     cur.execute("SELECT COUNT(*), SUM(gallons), SUM(saving) FROM fuel WHERE user_id=? AND date>=?", (user_id, str(monday)))
     row=cur.fetchone()
     con.close()
-    if row[0] is None: return (0,0,0)
+    if not row or row[0] is None: return (0,0,0)
     return (row[0], row[1] or 0, row[2] or 0)
 
 def nums(t):
-    t=t.replace(' ','').replace('..','.')
-    found=[]
-    for n in re.findall(r"\d+\.\d+", t.replace(',','.')):
-        try:
-            v=float(n)
-            # Фикс 36.118 -> 361.18
-            if 30 < v < 40:
-                v = v*10
-            found.append(v)
-        except:
-            pass
-    return found
+    t = t.replace('$','').replace(',','.').lower()
+    return [float(n) for n in re.findall(r"\d+\.\d+", t) if 0.5 < float(n) < 1000]
 
 async def ask_gpt(b):
     b64=base64.b64encode(b).decode()
-    prompt="Read fuel pump: This Sale, Gallons, Price per gallon. Return numbers only like 361.18, 69.74, 5.359"
-    for _ in range(3):
-        try:
-            r=client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}],
-                max_tokens=80
-            )
-            return r.choices[0].message.content
-        except Exception as e:
-            print(f"GPT error: {e}")
-            time.sleep(1)
-    return ""
+    prompt = """
+You are fuel receipt OCR. Look at image and return JSON only.
+
+If it's pump display: {"pump_price": 5.359, "sale": 361.18, "gallons": 69.74}
+If it's map: {"app_price": 4.80}
+If it's TA receipt like in example: {"diesel_gallons": 69.74, "diesel_price": 5.179, "def_gallons": 2.916, "def_price": 4.899, "total": 375.47, "location": "TA Grand Island"}
+
+Return ONLY valid JSON. No text.
+If 361.18 looks like 36 1.18, fix it to 361.18.
+"""
+    try:
+        r=client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":[
+                {"type":"text","text":prompt},
+                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}],
+            max_tokens=150
+        )
+        txt = r.choices[0].message.content.strip()
+        # Достаем JSON даже если GPT добавил текст
+        m = re.search(r'\{.*\}', txt, re.DOTALL)
+        if m: txt = m.group(0)
+        print(f"GPT JSON: {txt}")
+        return json.loads(txt)
+    except Exception as e:
+        print(f"GPT error {e}")
+        return {}
 
 user_data={}
 
 async def start(u,c):
     con=sqlite3.connect(DB)
     con.execute("INSERT OR REPLACE INTO users VALUES (?,?)", (u.effective_user.id, u.effective_chat.id))
-    con.commit()
-    con.close()
-    await u.message.reply_text("✅ Готов! Кидай фото.")
+    con.commit(); con.close()
+    user_data[u.effective_user.id]={'prices':[], 'gallons':[], 'sale':[], 't':0, 'loc':""}
+    await u.message.reply_text("✅ v7 готов! Кидай любые фото: колонка, карта $4.80, или чек TA. Понимаю всё.")
+
+async def handle_data(uid, data, update):
+    now=time.time()
+    if uid not in user_data or now - user_data[uid]['t'] > 180:
+        user_data[uid]={'prices':[], 'gallons':[], 'sale':[], 't':now, 'loc':""}
+    user_data[uid]['t']=now
+
+    # Собираем данные
+    if "pump_price" in data: user_data[uid]['prices'].append(data["pump_price"])
+    if "app_price" in data: user_data[uid]['prices'].append(data["app_price"])
+    if "diesel_price" in data: user_data[uid]['prices'].append(data["diesel_price"])
+    if "gallons" in data: user_data[uid]['gallons'].append(data["gallons"])
+    if "diesel_gallons" in data: user_data[uid]['gallons'].append(data["diesel_gallons"])
+    if "sale" in data: user_data[uid]['sale'].append(data["sale"])
+    if "location" in data: user_data[uid]['loc']=data["location"]
+    if "total" in data and "diesel_gallons" in data: # чек
+        user_data[uid]['sale'].append(data["total"])
+
+    prices = user_data[uid]['prices']
+    gallons = user_data[uid]['gallons']
+    sales = user_data[uid]['sale']
+
+    print(f"STATE prices={prices} gallons={gallons} sale={sales}")
+
+    # Логика расчета
+    if len(prices) >= 1 and len(gallons) >= 1:
+        # Если есть 2 цены - считаем скидку
+        if len(prices) >= 2:
+            p_sorted = sorted(prices)
+            # Игнорируем DEF цену 4.899 если она мешает - берем дизельные цены
+            # Дизель обычно 5.1-5.3, DEF 4.8-4.9, карта 4.80
+            # Скидка = макс - мин
+            pump = max(prices)
+            app = min(prices)
+            # Если в чеке есть и дизель и DEF, app будет DEF - это не правильно, берем 2 самых больших для дизеля
+            if len(prices)>=3:
+                # Убираем самую маленькую если это DEF и есть еще маленькая (карта)
+                pass
+
+            gal = max(gallons)
+            disc = pump - app
+            if disc < 0: disc = -disc
+            if disc > 1.5: # Если скидка больше $1.5 - это глюк, берем pump - 2-я цена
+                disc = sorted(prices)[-1] - sorted(prices)[-2]
+
+            saving = disc * gal
+            date_now=datetime.datetime.now().strftime("%m/%d/%Y")
+            loc = user_data[uid]['loc']
+
+            add_fuel(uid, gal, disc, saving, loc)
+            await update.message.reply_text(f"📅 Дата: {date_now}\n📍 {loc}\n⛽ Галлонов: {gal:.3f}\n💸 Скидка: ${disc:.3f}/gal ( {pump:.3f} - {app:.3f} )\n💰 Экономия: ${saving:.2f}")
+            user_data[uid]={'prices':[], 'gallons':[], 'sale':[], 't':0, 'loc':""}
+        else:
+            # Только одна цена и галлоны - ждем вторую цену или считаем если это чек
+            if len(sales)==0 and len(gallons)>=1:
+                await update.message.reply_text(f"Принял: цена {prices[0]}, галлонов {gallons[0]} ✅ Теперь кинь вторую цену (карту $4.80 или колонку 5.359) или напиши цифрами")
+            else:
+                # Если это чек типа 69.74 at 5.179 - считаем как есть, без скидки от колонки
+                gal = max(gallons)
+                price = prices[0]
+                # Если есть sale и gallons, вычислим pump из sale
+                if sales:
+                    # total $375 включает DEF, нельзя
+                    pass
+                await update.message.reply_text(f"Принял чек: {gal} gal по {price}. Кинь еще фото колонки 5.359 чтобы посчитать скидку, или скажи /report")
 
 async def photo(u,c):
     uid=u.effective_user.id
-    print(f"Photo from {uid}")
-    chat_file=await u.message.photo[-1].get_file()
-    img_bytes=bytes(await chat_file.download_as_bytearray())
-    txt=await ask_gpt(img_bytes)
-    print(f"GPT raw: {txt}")
-    found=nums(txt)
-    print(f"Found: {found}")
+    file=await u.message.photo[-1].get_file()
+    img=bytes(await file.download_as_bytearray())
+    data=await ask_gpt(img)
+    if not data:
+        await u.message.reply_text("Не понял фото, попробуй крупнее или напиши цифры текстом")
+        return
+    await handle_data(uid, data, u)
 
-    now=time.time()
-    if uid not in user_data:
-        user_data[uid]={'n':[],'t':now}
-    if now - user_data[uid]['t'] > 90:
-        user_data[uid]={'n':[],'t':now}
-
-    user_data[uid]['n'].extend(found)
-    user_data[uid]['t']=now
-    all_n=user_data[uid]['n']
-    print(f"All: {all_n}")
-
-    small=[n for n in all_n if 3 <= n <= 6.6]
-    mid=[n for n in all_n if 10 < n < 200 and n not in small]
-    large=[n for n in all_n if n >= 200]
-
-    if len(small) >= 1 and len(mid) >= 1:
-        app_price=min(small)
-        pump_price=max(small) if len(small)>1 else 5.359
-        gal=max(mid)
-        # Если есть Sale, используем его для точности
-        if large:
-            sale = max(large)
-            # Пересчитаем pump из Sale/Gal если small только 1
-            if len(small)==1 and gal>0:
-                pump_price = sale / gal
-
-        disc=pump_price-app_price
-        saving=disc*gal
-        date_now=datetime.datetime.now().strftime("%m/%d/%Y")
-        add_fuel(uid, gal, disc, saving)
-        await u.message.reply_text(f"📅 Дата: {date_now}\n⛽ Галлонов: {gal:.3f}\n💸 Скидка: ${disc:.3f}/gal\n💰 Экономия: ${saving:.2f}")
-        user_data[uid]={'n':[],'t':0}
-    else:
-        await u.message.reply_text(f"Принял {found}, кидай еще 1 фото... Собрал: {all_n}")
+async def text_msg(u,c):
+    # Позволяет написать 4.80 текстом
+    found=nums(u.message.text)
+    if not found: return
+    uid=u.effective_user.id
+    # Если написал 2 числа - это цены
+    data={}
+    if len(found)==1:
+        data={"app_price": found[0]}
+    elif len(found)>=2:
+        data={"app_price": found[0], "pump_price": found[1], "gallons": max(found) if max(found)>10 else 0}
+        if data["gallons"]==0: del data["gallons"]
+    await handle_data(uid, data, u)
 
 async def report_cmd(u,c):
     count, gallons, saving = get_weekly(u.effective_user.id)
-    if count==0:
-        await u.message.reply_text("Заправок на этой неделе нет")
-    else:
-        await u.message.reply_text(f"📊 Отчет с понедельника:\n⛽ Заправок: {count}\n🛢️ Галлонов: {gallons:.1f}\n💰 Экономия: ${saving:.2f}")
-
-async def weekly_job(context):
-    con=sqlite3.connect(DB)
-    cur=con.cursor()
-    cur.execute("SELECT user_id, chat_id FROM users")
-    for user_id, chat_id in cur.fetchall():
-        count, gallons, saving = get_weekly(user_id)
-        if count>0:
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"📊 ОТЧЕТ ПЯТНИЦА:\n⛽ Заправок: {count}\n🛢️ Всего галлонов: {gallons:.1f}\n💰 Всего скидка: ${saving:.2f}")
-            except:
-                pass
-    con.close()
-
-if __name__=="__main__":
-    init_db()
-    app=ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("report",report_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO,photo))
-    # Пятница 8:00 утра Central = 13:00 UTC
-    try:
-        app.job_queue.run_daily(weekly_job, time=datetime.time(hour=13, minute=0, second=0), days=(4,))
-        print("Job queue OK")
-    except Exception as e:
-        print(f"Job queue error: {e}")
-    print("v6.2 fixed started")
-    app.run_polling()
+    if count==0: await u.message.reply_text("
