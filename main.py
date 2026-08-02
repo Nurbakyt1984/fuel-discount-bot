@@ -1,134 +1,130 @@
-import os, re, base64, datetime, sqlite3, json, time
+import os, re, base64, datetime, sqlite3, json, asyncio, time
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 TOKEN = os.environ.get("BOT_TOKEN")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_KEY)
-DB = "fuel.db"
-CENTRAL = ZoneInfo("America/Chicago")
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+DB="fuel.db"
+CENTRAL=ZoneInfo("America/Chicago")
 
 def init_db():
     con=sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS fuel (user_id INTEGER, date TEXT, gallons REAL, disc REAL, saving REAL, loc TEXT)")
     con.commit(); con.close()
-
-def add_fuel(uid, gal, disc, save, loc=""):
+def add_fuel(uid,gal,disc,save,loc=""):
     con=sqlite3.connect(DB)
-    now_str = datetime.datetime.now(CENTRAL).strftime("%Y-%m-%d %H:%M")
-    con.execute("INSERT INTO fuel VALUES (?,?,?,?,?,?)", (uid, now_str, gal, disc, save, loc))
+    con.execute("INSERT INTO fuel VALUES (?,?,?,?,?,?)",(uid,datetime.datetime.now(CENTRAL).strftime("%Y-%m-%d %H:%M"),gal,disc,save,loc))
     con.commit(); con.close()
-
 def get_weekly(uid):
     con=sqlite3.connect(DB)
-    today = datetime.datetime.now(CENTRAL).date()
-    days_since_friday = (today.weekday() - 4) % 7
-    last_friday = today - datetime.timedelta(days=days_since_friday)
-    next_friday = last_friday + datetime.timedelta(days=7)
+    today=datetime.datetime.now(CENTRAL).date()
+    days_since=(today.weekday()-4)%7
+    last_fri=today-datetime.timedelta(days=days_since)
+    next_fri=last_fri+datetime.timedelta(days=7)
     cur=con.cursor()
-    cur.execute("SELECT COUNT(*), SUM(gallons), SUM(saving) FROM fuel WHERE user_id=? AND date>=? AND date<?", (uid, str(last_friday), str(next_friday)))
+    cur.execute("SELECT COUNT(*), SUM(gallons), SUM(saving) FROM fuel WHERE user_id=? AND date>=? AND date<?",(uid,str(last_fri),str(next_fri)))
     r=cur.fetchone()
-    cur.execute("SELECT SUM(gallons), SUM(saving) FROM fuel WHERE user_id=?", (uid,))
+    cur.execute("SELECT SUM(gallons), SUM(saving) FROM fuel WHERE user_id=?",(uid,))
     r2=cur.fetchone()
     con.close()
-    week = (r[0], r[1] or 0, r[2] or 0) if r and r[0] else (0,0,0)
-    total = (r2[0] or 0, r2[1] or 0) if r2 else (0,0)
-    return week, total, last_friday, next_friday
+    return (r[0],r[1] or 0,r[2] or 0) if r and r[0] else (0,0,0),(r2[0] or 0,r2[1] or 0),last_fri,next_fri
 
 async def ask_gpt(b):
     b64=base64.b64encode(b).decode()
-    prompt='ONLY JSON. Read ONLY this image, no memory. pump_price LED 5.439, diesel_price receipt at 5.179, diesel_gallons 69.74, pump_gallons bottom number 120.553, app_price map bubble $4.94 or $4.80. Return {"pump_price":5.439,"pump_gallons":120.553,"app_price":4.94} format. Only JSON.'
-    r=client.chat.completions.create(model="gpt-4o-mini",
-        messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}],
-        max_tokens=120)
+    prompt='ONLY JSON no memory: pump_price 5.359 LED, diesel_price receipt, pump_gallons or diesel_gallons bottom like 69.740, app_price map $4.80. Only JSON.'
+    r=client.chat.completions.create(model="gpt-4o-mini",messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}],max_tokens=100)
     txt=r.choices[0].message.content.strip()
-    m=re.search(r'\{.*\}', txt, re.DOTALL)
+    m=re.search(r'\{.*\}',txt,re.DOTALL)
     if m: txt=m.group(0)
-    print(f"GPT raw: {txt}", flush=True)
+    print(f"GPT:{txt}",flush=True)
     try: return json.loads(txt)
     except: return {}
 
-user_cache={}
+album_buffer={}
+album_lock=asyncio.Lock()
 
-async def try_calc(uid, chat_id, context):
-    data=user_cache.get(uid)
-    if not data: return
-    if time.time()-data['ts']>15:
-        del user_cache[uid]; return
-    pump=data.get('pump'); diesel=data.get('diesel'); app=data.get('app'); gal=data.get('gal')
-    has_pump=data.get('has_pump',False); has_receipt=data.get('has_receipt',False)
-    print(f"TRY CALC pump={pump} diesel={diesel} app={app} gal={gal}", flush=True)
-    if gal is None or app is None: return
-    if has_pump:
-        base=pump; label=f"Колонка {pump:.3f}"
-    elif has_receipt:
-        base=diesel; label=f"Чек {diesel:.3f}"
-    else: return
-    disc=base-app; save=disc*gal
-    add_fuel(uid,gal,disc,save,"TA Grand Island")
-    await context.bot.send_message(chat_id=chat_id,
-        text=f"📅 {datetime.datetime.now(CENTRAL).strftime('%m/%d/%Y')}\n📍 TA Grand Island\n⛽ {gal:.3f} gal DIESEL (без DEF)\n{label}, Карта: {app:.3f}\n💸 Скидка ${disc:.3f}/gal ({base:.3f} - {app:.3f})\n💰 Экономия ${save:.2f}")
-    del user_cache[uid]
+async def process_album(gid, context):
+    async with album_lock:
+        if gid not in album_buffer: return
+        data=album_buffer.pop(gid)
+    files=data['files']; uid=data['uid']; chat_id=data['chat_id']
+    # ТОЛЬКО ЭТОТ КОЛЛАЖ, НИКАКИХ СТАРЫХ
+    results=[]
+    for b in files:
+        results.append(await ask_gpt(b))
 
-async def photo(u,c):
-    uid=u.effective_user.id
-    try:
-        f=await u.message.photo[-1].get_file()
-        b=bytes(await f.download_as_bytearray())
-        d=await ask_gpt(b)
-        now=time.time()
-        if uid not in user_cache or now - user_cache[uid]['ts'] > 15:
-            user_cache[uid]={'ts':now}
-        cache=user_cache[uid]
-        cache['ts']=now
+    pump=diesel=app=gal=None
+    has_pump=has_receipt=False
+    for d in results:
         if "pump_price" in d:
             try:
                 v=float(str(d["pump_price"]).replace(',','.'))
-                if 2.5<=v<=7.5: cache['pump']=v; cache['has_pump']=True
+                if 2.5<=v<=7.5: pump=v; has_pump=True
             except: pass
         if "diesel_price" in d:
             try:
                 v=float(str(d["diesel_price"]).replace(',','.'))
-                if 2.5<=v<=7.5: cache['diesel']=v; cache['has_receipt']=True
+                if 2.5<=v<=7.5: diesel=v; has_receipt=True
             except: pass
         if "app_price" in d:
             try:
                 v=float(str(d["app_price"]).replace(',','.'))
-                if 2.5<=v<=7.5: cache['app']=v
+                if 2.5<=v<=7.5: app=v
             except: pass
         for k in ["diesel_gallons","pump_gallons","gallons"]:
             if k in d:
                 try:
                     v=float(str(d[k]).replace(',','.'))
-                    if 1<=v<=200: cache['gal']=v
+                    if 1<=v<=300: gal=v
                 except: pass
-        await try_calc(uid,u.effective_chat.id,c)
-    except Exception as e:
-        print(f"ERROR: {e}", flush=True)
-        await c.bot.send_message(chat_id=u.effective_chat.id,text=f"Ошибка: {e}")
+
+    print(f"FINAL GID {gid}: pump={pump} diesel={diesel} app={app} gal={gal}",flush=True)
+    if gal is None or app is None or (pump is None and diesel is None):
+        return
+
+    if has_pump and pump is not None:
+        base=pump; label=f"Колонка {pump:.3f}"
+    else:
+        base=diesel; label=f"Чек {diesel:.3f}"
+
+    disc=base-app; save=disc*gal
+    add_fuel(uid,gal,disc,save,"TA Grand Island")
+    await context.bot.send_message(chat_id=chat_id,
+        text=f"📅 {datetime.datetime.now(CENTRAL).strftime('%m/%d/%Y')}\n📍 TA Grand Island\n⛽ {gal:.3f} gal DIESEL (без DEF)\n{label}, Карта: {app:.3f}\n💸 Скидка ${disc:.3f}/gal ({base:.3f} - {app:.3f})\n💰 Экономия ${save:.2f}")
+
+async def album_job(context):
+    await process_album(context.job.data['gid'], context)
+
+async def photo(u,c):
+    uid=u.effective_user.id
+    gid=u.message.media_group_id or f"single_{u.message.message_id}_{uid}_{time.time()}"
+    f=await u.message.photo[-1].get_file()
+    b=bytes(await f.download_as_bytearray())
+    async with album_lock:
+        if gid not in album_buffer:
+            album_buffer[gid]={'uid':uid,'chat_id':u.effective_chat.id,'files':[]}
+        album_buffer[gid]['files'].append(b)
+    for j in c.job_queue.get_jobs_by_name(f"a{gid}"): j.schedule_removal()
+    # 0.8 сек - успевает собрать твой коллаж из 3 фото
+    c.job_queue.run_once(album_job, 0.8, data={'gid':gid}, name=f"a{gid}")
 
 async def start(u,c):
-    user_cache.pop(u.effective_user.id,None)
-    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ v28 готов! Кидай коллаж Пт-Пт CT")
+    async with album_lock: album_buffer.clear()
+    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ v29 - только этот коллаж, без старых")
 async def clear_cmd(u,c):
-    user_cache.pop(u.effective_user.id,None)
+    async with album_lock: album_buffer.clear()
     await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ Очищено")
 async def report_cmd(u,c):
-    try:
-        (cnt,gal,save),(total_gal,total_save),last_fri,next_fri = get_weekly(u.effective_user.id)
-        text=f"📊 ОТЧЕТ | Пт-Пт {last_fri.strftime('%m/%d')} - {next_fri.strftime('%m/%d')} CT\nПолучено скидок: ${total_save:.2f} | Заправлено: {total_gal:.1f} галлон\n\nС {last_fri.strftime('%m/%d')} по сегодня: {cnt} зап • {gal:.1f} gal • ${save:.2f}\nВсего: {total_gal:.1f} gal • ${total_save:.2f}"
-        await c.bot.send_message(chat_id=u.effective_chat.id,text=text)
-    except Exception as e:
-        await c.bot.send_message(chat_id=u.effective_chat.id,text=f"report error: {e}")
+    (cnt,gal,save),(total_gal,total_save),last_fri,next_fri=get_weekly(u.effective_user.id)
+    await c.bot.send_message(chat_id=u.effective_chat.id,text=f"📊 ОТЧЕТ | Пт-Пт {last_fri.strftime('%m/%d')} - {next_fri.strftime('%m/%d')} CT\nПолучено скидок: ${total_save:.2f} | Заправлено: {total_gal:.1f} галлон\nС {last_fri.strftime('%m/%d')} по сегодня: {cnt} зап • {gal:.1f} gal • ${save:.2f}")
 
 if __name__=="__main__":
     init_db()
     app=ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("clear",clear_cmd))
-    app.add_handler(CommandHandler("Clear",clear_cmd))
     app.add_handler(CommandHandler("report",report_cmd))
     app.add_handler(MessageHandler(filters.PHOTO,photo))
-    print("v28 FINAL", flush=True)
+    print("v29 NO OLD DATA",flush=True)
     app.run_polling()
