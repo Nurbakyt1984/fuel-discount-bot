@@ -1,47 +1,78 @@
-import sqlite3
-from datetime import datetime, timedelta
+import os
+import re
+import io
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
-import openpyxl, os, re
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from PIL import Image
+import pytesseract
 
-BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН"
-DB = "fuel.db"
+TOKEN = os.environ.get("BOT_TOKEN")
 
-def init():
-    c = sqlite3.connect(DB)
-    c.execute('CREATE TABLE IF NOT EXISTS f(date TEXT, pump REAL, disc REAL, gal REAL, total REAL, saved REAL)')
-    c.commit(); c.close()
+def extract_numbers(text):
+    nums = re.findall(r"\d+\.\d+", text.replace(',', '.'))
+    return [float(n) for n in nums]
 
-async def start(u,c):
-    await u.message.reply_text("Кидай фото чека и пиши так: 5.439 4.80 69.74\nЯ сам посчитаю!\n/report - отчет за неделю")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Бот для расчета скидки готов!\n\n"
+        "Отправь фото колонки TA (где 361.18 и 69.740)\n"
+        "А в подписи к фото напиши цену из приложения, например: 4.80\n\n"
+        "Я посчитаю скидку!"
+    )
 
-async def handle_text(u,c):
-    txt = u.message.text
-    nums = [float(x) for x in re.findall(r"\d+\.\d+", txt)]
-    if len(nums) < 3:
-        await u.message.reply_text("Нужно 3 цифры: цена колонки, цена скидки, галлоны\nПример: 5.439 4.80 69.74")
-        return
-    pump, disc, gal = nums[0], nums[1], nums[2]
-    total = disc*gal
-    saved = (pump-disc)*gal
-    con = sqlite3.connect(DB); con.execute("INSERT INTO f VALUES (?,?,?,?,?,?)",(datetime.now().isoformat(),pump,disc,gal,total,saved)); con.commit(); con.close()
-    await u.message.reply_text(f"✅ Сохранено!\nГаллоны: {gal}\nСэкономил: ${saved:.2f}")
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📸 Читаю фото...")
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        img_bytes = await file.download_as_bytearray()
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        text = pytesseract.image_to_string(img, config='--psm 6')
+        nums = extract_numbers(text)
+        
+        if not nums:
+            await update.message.reply_text(f"Не вижу цифр, попробуй четче сфоткать.\nЯ вижу текст: {text[:200]}")
+            return
 
-async def report(u,c):
-    today = datetime.now()
-    last_f = today - timedelta(days=(today.weekday()-4)%7+7)
-    con = sqlite3.connect(DB); rows = con.execute("SELECT * FROM f WHERE date>=?",(last_f.isoformat(),)).fetchall(); con.close()
-    if not rows: await u.message.reply_text("Нет данных"); return
-    tg = sum(r[3] for r in rows); ts = sum(r[5] for r in rows)
-    wb=openpyxl.Workbook(); ws=wb.active; ws.append(["Дата","Колонка","Скидка","Галлоны","Сэкономлено"])
-    for r in rows: ws.append([r[0][:10],r[1],r[2],r[3],r[5]])
-    ws.append([]); ws.append(["ИТОГО","","",tg,ts])
-    fn="otchet.xlsx"; wb.save(fn)
-    await u.message.reply_document(open(fn,'rb'), caption=f"Отчет {last_f.strftime('%d.%m')} - {today.strftime('%d.%m')}\nСэкономлено: ${ts:.2f}")
+        total_sale = max([n for n in nums if n > 20], default=0)
+        gallons = 0
+        # gallons обычно 69.740 - ищем
+        for n in nums:
+            if 5 < n < 200 and n != total_sale:
+                gallons = n
+                break
+        
+        price_pump = min([n for n in nums if n < 10], default=0)
+        
+        caption_nums = extract_numbers(update.message.caption or "")
+        price_app = min([n for n in caption_nums if n < 10], default=0) if caption_nums else 0
 
-app = Application.builder().token(BOT_TOKEN).build()
-init()
-app.add_handler(CommandHandler("start",start))
-app.add_handler(CommandHandler("report",report))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.run_polling()
+        msg = f"🔍 Нашел на фото: {nums}\n\n"
+        if total_sale: msg += f"💰 This Sale: ${total_sale}\n"
+        if gallons: msg += f"⛽ Gallons: {gallons}\n"
+        if price_pump: msg += f"🏷️ Цена на колонке: ${price_pump}\n"
+        if price_app: msg += f"📱 Цена в приложении: ${price_app}\n"
+
+        if gallons and price_app and price_pump:
+            disc_per = price_pump - price_app
+            total_disc = disc_per * gallons
+            msg += f"\n💸 РЕЗУЛЬТАТ:\nСкидка: ${disc_per:.3f} / галлон\nЭкономия: ${total_disc:.2f}\nИтого: ${total_sale} (экономия уже внутри)"
+        elif gallons and total_sale:
+            real_price = total_sale / gallons
+            msg += f"\nФактическая цена: ${real_price:.3f} / галлон"
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("Нет BOT_TOKEN!")
+        exit(1)
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    print("Бот запущен...")
+    app.run_polling()
