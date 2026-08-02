@@ -1,142 +1,82 @@
-import os
-import re
-import io
-import time
-from PIL import Image, ImageOps, ImageEnhance
-import pytesseract
+import os, re, io, base64, time
+from PIL import Image
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
 
-# Хранилище для фото из альбома (3 фото за 1 раз)
 user_photos = {}
 
-def preprocess_for_ocr(pil_img):
-    # Увеличиваем и чистим для чтения цифр на колонке
-    img = pil_img.convert("L")
-    w, h = img.size
-    img = img.resize((w*3, h*3), Image.LANCZOS)
-    img = ImageOps.autocontrast(img, cutoff=2)
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.5)
-    # Черно-белый порог
-    img = img.point(lambda x: 255 if x > 160 else 0)
-    return img
+def extract_numbers(text):
+    return [float(n) for n in re.findall(r"\d+\.\d+", text.replace(',','.'))]
 
-def extract_numbers_from_text(text):
-    text = text.replace(',', '.').replace(' ', '')
-    # Ищем цифры типа 5.359, 361.18, 69.740, 4.80, 0.2
-    nums = re.findall(r"\d+\.\d+", text)
-    return [float(n) for n in nums]
-
-async def ocr_photo(pil_img):
-    all_nums = []
-    # Пробуем 3 варианта обработки
-    for mode in [0, 1, 2]:
-        if mode == 0:
-            processed = preprocess_for_ocr(pil_img)
-        elif mode == 1:
-            processed = ImageOps.invert(preprocess_for_ocr(pil_img))
-        else:
-            processed = pil_img.convert("L").resize((pil_img.size[0]*4, pil_img.size[1]*4), Image.LANCZOS)
-
-        for psm in ['6', '7', '11']:
-            try:
-                txt = pytesseract.image_to_string(processed, config=f'--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789.$')
-                all_nums.extend(extract_numbers_from_text(txt))
-            except:
-                pass
-    return list(set(all_nums))
+async def ask_gpt(image_bytes):
+    b64 = base64.b64encode(image_bytes).decode()
+    prompt = """Read all numbers from this fuel station photo.
+    Find: This Sale $ (like 361.18), Gallons (like 69.740), Price per gallon $ (like 5.359), and app price $ (like 4.80 if visible on map).
+    Return ONLY numbers like: 361.18, 69.740, 5.359, 4.80
+    If you see a map with $4.80, include it."""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role":"user",
+                "content":[
+                    {"type":"text","text":prompt},
+                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }],
+            max_tokens=100
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return str(e)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Версия 3.0 - ЧИТАЮ ФОТО АВТОМАТОМ!\n\n"
-        "Просто скинь 2-3 фото как раньше:\n"
-        "1. Скрин карты с $4.80\n"
-        "2. Фото колонки с 5.359\n"
-        "3. Фото с 361.18 и 69.740\n\n"
-        "Можешь кинуть все 3 сразу - я сложу и посчитаю скидку!"
-    )
+    await update.message.reply_text("✅ v4.0 AI готов! Кидай 3 фото и я сам прочитаю все цифры!")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("📸 Читаю...")
+    await update.message.reply_text("🤖 AI читает фото... 3 сек")
 
-    try:
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        img_bytes = await file.download_as_bytearray()
-        pil_img = Image.open(io.BytesIO(img_bytes))
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    img_bytes = await file.download_as_bytearray()
 
-        nums = await ocr_photo(pil_img)
-        print(f"OCR found: {nums}")
+    text = await ask_gpt(bytes(img_bytes))
+    nums = extract_numbers(text)
 
-        # Сохраняем цифры пользователя за последние 60 сек
-        now = time.time()
-        if user_id not in user_photos or now - user_photos[user_id]['time'] > 60:
-            user_photos[user_id] = {'nums': [], 'time': now}
+    now = time.time()
+    if user_id not in user_photos or now - user_photos[user_id]['time'] > 90:
+        user_photos[user_id] = {'nums': [], 'time': now}
+    user_photos[user_id]['nums'].extend(nums)
+    user_photos[user_id]['time'] = now
+    combined = user_photos[user_id]['nums']
 
-        user_photos[user_id]['nums'].extend(nums)
-        user_photos[user_id]['time'] = now
+    # считаем
+    small = [n for n in combined if 3 <= n <= 6.5]
+    price_app = min(small) if small else 0
+    price_pump = max(small) if len(small)>1 else (small[0] if small else 5.359)
+    total_sale = max([n for n in combined if n>100], default=0)
+    gallons = max([n for n in combined if 5<n<150 and n not in small and n!=total_sale], default=0)
 
-        combined = user_photos[user_id]['nums']
-
-        # Ищем нужные цифры
-        price_app = 0
-        price_pump = 0
-        total_sale = 0
-        gallons = 0
-
-        # $4.80 обычно на карте, 3-6 диапазон
-        small_prices = [n for n in combined if 3.0 <= n <= 6.5]
-        if small_prices:
-            # Самая маленькая это $4.80, самая большая 5.359
-            price_app = min(small_prices)
-            price_pump = max(small_prices)
-
-        large = [n for n in combined if n > 20]
-        if large:
-            total_sale = max(large)
-
-        # Галлоны 69.740 - от 5 до 200 но не цена
-        mid = [n for n in combined if 5 < n < 150 and n not in small_prices and n!= total_sale]
-        if mid:
-            gallons = max(mid)
-
-        # Если уже есть 2 главных цифры - считаем
-        if gallons and price_app:
-            if not price_pump:
-                price_pump = 5.359
-
-            disc_per = price_pump - price_app
-            total_disc = disc_per * gallons
-            final_price = gallons * price_app
-
-            msg = f"✅ НАШЕЛ ВСЕ!\n"
-            msg += f"💰 На колонке: ${total_sale if total_sale else '?'}\n"
-            msg += f"⛽ Галлоны: {gallons}\n"
-            msg += f"🏷️ Цена колонки: ${price_pump}\n"
-            msg += f"📱 Цена приложения: ${price_app}\n\n"
-            msg += f"💸 СКИДКА: ${disc_per:.3f} / галлон\n"
-            msg += f"💵 Экономия: ${total_disc:.2f}\n"
-            msg += f"💳 К оплате: ${final_price:.2f}"
-
-            await update.message.reply_text(msg)
-            user_photos[user_id] = {'nums': [], 'time': 0} # сброс
-        else:
-            await update.message.reply_text(f"Пока вижу: {combined}\nКинь еще фото колонки...")
-
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения: {e}")
-        print(e)
+    if gallons and price_app:
+        disc = price_pump - price_app
+        await update.message.reply_text(
+            f"✅ Прочитал: {text}\n"
+            f"Все цифры: {combined}\n\n"
+            f"💰 Sale: ${total_sale}\n⛽ Gal: {gallons}\n🏷️ Pump: ${price_pump}\n📱 App: ${price_app}\n\n"
+            f"💸 Скидка ${disc:.3f}/gal\n💵 Экономия ${disc*gallons:.2f}"
+        )
+        user_photos[user_id] = {'nums': [], 'time': 0}
+    else:
+        await update.message.reply_text(f"Пока вижу: {text} -> {nums}\nСобрал: {combined}\nКидай еще фото...")
 
 if __name__ == "__main__":
-    if not TOKEN:
-        print("Нет BOT_TOKEN")
-        exit(1)
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("Bot v3.0 started")
     app.run_polling()
