@@ -1,4 +1,4 @@
-import os, re, base64, datetime, sqlite3, json, asyncio, time
+import os, re, base64, datetime, sqlite3, json, time
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
@@ -27,8 +27,7 @@ def get_weekly(uid):
     last_friday = today - datetime.timedelta(days=days_since_friday)
     next_friday = last_friday + datetime.timedelta(days=7)
     cur=con.cursor()
-    cur.execute("SELECT COUNT(*), SUM(gallons), SUM(saving) FROM fuel WHERE user_id=? AND date>=? AND date<?",
-                (uid, str(last_friday), str(next_friday)))
+    cur.execute("SELECT COUNT(*), SUM(gallons), SUM(saving) FROM fuel WHERE user_id=? AND date>=? AND date<?", (uid, str(last_friday), str(next_friday)))
     r=cur.fetchone()
     cur.execute("SELECT SUM(gallons), SUM(saving) FROM fuel WHERE user_id=?", (uid,))
     r2=cur.fetchone()
@@ -39,14 +38,14 @@ def get_weekly(uid):
 
 async def ask_gpt(b):
     b64=base64.b64encode(b).decode()
-    prompt='ONLY JSON, read ONLY this image: pump_price LED 5.439, diesel_price receipt at 5.179, diesel_gallons 69.74, pump_gallons bottom 120.553, app_price map bubble $4.80 or $4.94. Only JSON.'
+    prompt='ONLY JSON. Read ONLY this image, no memory. pump_price LED 5.439, diesel_price receipt at 5.179, diesel_gallons 69.74, pump_gallons bottom number 120.553, app_price map bubble $4.94 or $4.80. Return {"pump_price":5.439,"pump_gallons":120.553,"app_price":4.94} format. Only JSON.'
     r=client.chat.completions.create(model="gpt-4o-mini",
         messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}],
-        max_tokens=100)
+        max_tokens=120)
     txt=r.choices[0].message.content.strip()
     m=re.search(r'\{.*\}', txt, re.DOTALL)
     if m: txt=m.group(0)
-    print(f"GPT: {txt}")
+    print(f"GPT raw: {txt}", flush=True)
     try: return json.loads(txt)
     except: return {}
 
@@ -55,15 +54,15 @@ user_cache={}
 async def try_calc(uid, chat_id, context):
     data=user_cache.get(uid)
     if not data: return
-    if time.time()-data['ts']>12:
+    if time.time()-data['ts']>15:
         del user_cache[uid]; return
     pump=data.get('pump'); diesel=data.get('diesel'); app=data.get('app'); gal=data.get('gal')
     has_pump=data.get('has_pump',False); has_receipt=data.get('has_receipt',False)
+    print(f"TRY CALC pump={pump} diesel={diesel} app={app} gal={gal}", flush=True)
     if gal is None or app is None: return
-    if not has_pump and not has_receipt: return
-    if has_pump and pump is not None:
+    if has_pump:
         base=pump; label=f"Колонка {pump:.3f}"
-    elif has_receipt and diesel is not None:
+    elif has_receipt:
         base=diesel; label=f"Чек {diesel:.3f}"
     else: return
     disc=base-app; save=disc*gal
@@ -74,48 +73,54 @@ async def try_calc(uid, chat_id, context):
 
 async def photo(u,c):
     uid=u.effective_user.id
-    f=await u.message.photo[-1].get_file()
-    b=bytes(await f.download_as_bytearray())
-    d=await ask_gpt(b)
-    print(f"PHOTO {uid} -> {d}")
-    now=time.time()
-    if uid not in user_cache or now - user_cache[uid]['ts'] > 12:
-        user_cache[uid]={'ts':now}
-    cache=user_cache[uid]
-    cache['ts']=now
-    if "pump_price" in d:
-        try:
-            v=float(str(d["pump_price"]).replace(',','.'))
-            if 2.5<=v<=7.5: cache['pump']=v; cache['has_pump']=True
-        except: pass
-    if "diesel_price" in d:
-        try:
-            v=float(str(d["diesel_price"]).replace(',','.'))
-            if 2.5<=v<=7.5: cache['diesel']=v; cache['has_receipt']=True
-        except: pass
-    if "app_price" in d:
-        try:
-            v=float(str(d["app_price"]).replace(',','.'))
-            if 2.5<=v<=7.5: cache['app']=v
-        except: pass
-    for k in ["diesel_gallons","pump_gallons","gallons"]:
-        if k in d:
+    try:
+        f=await u.message.photo[-1].get_file()
+        b=bytes(await f.download_as_bytearray())
+        d=await ask_gpt(b)
+        now=time.time()
+        if uid not in user_cache or now - user_cache[uid]['ts'] > 15:
+            user_cache[uid]={'ts':now}
+        cache=user_cache[uid]
+        cache['ts']=now
+        if "pump_price" in d:
             try:
-                v=float(str(d[k]).replace(',','.'))
-                if 1<=v<=200: cache['gal']=v
+                v=float(str(d["pump_price"]).replace(',','.'))
+                if 2.5<=v<=7.5: cache['pump']=v; cache['has_pump']=True
             except: pass
-    await try_calc(uid,u.effective_chat.id,c)
+        if "diesel_price" in d:
+            try:
+                v=float(str(d["diesel_price"]).replace(',','.'))
+                if 2.5<=v<=7.5: cache['diesel']=v; cache['has_receipt']=True
+            except: pass
+        if "app_price" in d:
+            try:
+                v=float(str(d["app_price"]).replace(',','.'))
+                if 2.5<=v<=7.5: cache['app']=v
+            except: pass
+        for k in ["diesel_gallons","pump_gallons","gallons"]:
+            if k in d:
+                try:
+                    v=float(str(d[k]).replace(',','.'))
+                    if 1<=v<=200: cache['gal']=v
+                except: pass
+        await try_calc(uid,u.effective_chat.id,c)
+    except Exception as e:
+        print(f"ERROR: {e}", flush=True)
+        await c.bot.send_message(chat_id=u.effective_chat.id,text=f"Ошибка: {e}")
 
 async def start(u,c):
     user_cache.pop(u.effective_user.id,None)
-    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ v27 готов! Пт-Пт по Central")
+    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ v28 готов! Кидай коллаж Пт-Пт CT")
 async def clear_cmd(u,c):
     user_cache.pop(u.effective_user.id,None)
     await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ Очищено")
 async def report_cmd(u,c):
-    (cnt,gal,save),(total_gal,total_save),last_fri,next_fri = get_weekly(u.effective_user.id)
-    text=f"📊 ОТЧЕТ | Пт-Пт {last_fri.strftime('%m/%d')} - {next_fri.strftime('%m/%d')} CT\nПолучено скидок: ${total_save:.2f} | Заправлено: {total_gal:.1f} галлон\n\nС {last_fri.strftime('%m/%d')} по сегодня: {cnt} зап • {gal:.1f} gal • ${save:.2f}\nВсего: {total_gal:.1f} gal • ${total_save:.2f}"
-    await c.bot.send_message(chat_id=u.effective_chat.id,text=text)
+    try:
+        (cnt,gal,save),(total_gal,total_save),last_fri,next_fri = get_weekly(u.effective_user.id)
+        text=f"📊 ОТЧЕТ | Пт-Пт {last_fri.strftime('%m/%d')} - {next_fri.strftime('%m/%d')} CT\nПолучено скидок: ${total_save:.2f} | Заправлено: {total_gal:.1f} галлон\n\nС {last_fri.strftime('%m/%d')} по сегодня: {cnt} зап • {gal:.1f} gal • ${save:.2f}\nВсего: {total_gal:.1f} gal • ${total_save:.2f}"
+        await c.bot.send_message(chat_id=u.effective_chat.id,text=text)
+    except Exception as e:
+        await c.bot.send_message(chat_id=u.effective_chat.id,text=f"report error: {e}")
 
 if __name__=="__main__":
     init_db()
@@ -125,5 +130,5 @@ if __name__=="__main__":
     app.add_handler(CommandHandler("Clear",clear_cmd))
     app.add_handler(CommandHandler("report",report_cmd))
     app.add_handler(MessageHandler(filters.PHOTO,photo))
-    print("v27 FINAL CT FRIDAY-FRIDAY")
+    print("v28 FINAL", flush=True)
     app.run_polling()
