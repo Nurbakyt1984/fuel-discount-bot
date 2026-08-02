@@ -30,9 +30,16 @@ def get_weekly(uid):
 async def ask_gpt(b):
     if not client: return {"error":"NO_KEY"}
     b64=base64.b64encode(b).decode()
-    prompt='''You are fuel OCR. IGNORE DEF completely. Return ONLY JSON:
-{"pump_price":5.359, "app_price":4.80, "gallons":69.74, "diesel_gallons":69.74, "diesel_price":5.179, "location":"TA Grand Island"}
-Rules: Never return DEF, 2.916, 4.899. Only DIESEL line. Fix 36 1.18->361.18. Only JSON.'''
+    prompt='''You see 1-2 photos collaged. Read ALL prices. IGNORE DEF line.
+Return JSON with ALL you see:
+{"pump_price":5.359, "app_price":4.80, "diesel_gallons":69.74, "diesel_price":5.179, "location":"TA Grand Island"}
+Important:
+- If you see map with green bubble $4.80, return "app_price":4.80
+- If you see receipt with DIESEL 69.74 at 5.179, return "diesel_gallons":69.74 and "diesel_price":5.179
+- If you see pump 5.359, return "pump_price":5.359
+- NEVER return DEF 2.916 or 4.899
+- Look carefully at right side of image for $4.80 green bubble
+- Only JSON'''
     try:
         r=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}], max_tokens=150)
         txt=r.choices[0].message.content.strip()
@@ -51,22 +58,21 @@ async def start(u,c):
     con.execute("INSERT OR REPLACE INTO users VALUES (?,?)", (u.effective_user.id, u.effective_chat.id))
     con.commit(); con.close()
     user_data[u.effective_user.id]={'prices':[], 'gals':[], 'loc':"", 't':0}
-    await u.message.reply_text("v9.1 без DEF готов! Кидай чек - DEF игнорирую")
+    await u.message.reply_text("v9.2 без DEF + читаю $4.80 с карты! Кидай коллаж снова.")
 
 async def handle(uid, data, upd):
     if "error" in data:
-        await upd.message.reply_text(f"OpenAI ошибка: {data['error'][:400]}")
+        await upd.message.reply_text(f"OpenAI: {data['error'][:400]}")
         return
     now=time.time()
     if uid not in user_data or now-user_data[uid]['t']>300:
         user_data[uid]={'prices':[], 'gals':[], 'loc':"", 't':now}
     user_data[uid]['t']=now
 
-    # Добавляем только DIESEL, DEF уже отфильтрован GPT, но еще фильтруем тут
     for k in ["pump_price","app_price","diesel_price"]:
         if k in data:
             v=float(data[k])
-            if abs(v-4.899)>0.05 and abs(v-2.916)>0.05: # фильтр DEF
+            if abs(v-4.899)>0.05 and abs(v-2.916)>0.05:
                 user_data[uid]['prices'].append(v)
     for k in ["gallons","diesel_gallons"]:
         if k in data:
@@ -77,16 +83,38 @@ async def handle(uid, data, upd):
 
     prices=user_data[uid]['prices']
     gals=user_data[uid]['gals']
-    print(f"STATE no DEF: {prices} {gals}")
+    print(f"STATE: {prices} {gals}")
 
-    if len(prices)>=2 and len(gals)>=1:
-        pump=max(prices); app=min(prices); gal=max(gals)
-        disc=pump-app; save=disc*gal
+    # Убираем дубликаты одинаковых цен (чтобы не было 5.179-5.179=0)
+    uniq_prices=[]
+    for p in prices:
+        if not any(abs(p-x)<0.01 for x in uniq_prices):
+            uniq_prices.append(p)
+
+    if len(uniq_prices)>=2 and len(gals)>=1:
+        pump=max(uniq_prices)
+        app=min(uniq_prices)
+        gal=max(gals)
+        disc=pump-app
+        # Логика скидки: приоритет 5.359 - 4.80, а не 5.179
+        # Если есть 3 цены: 4.80, 5.179, 5.359 -> скидка = 5.359-4.80
+        if len(uniq_prices)>=3:
+            pump=max(uniq_prices)
+            app=min(uniq_prices)
+            disc=pump-app
+
+        save=disc*gal
         add_fuel(uid, gal, disc, save, user_data[uid]['loc'])
-        await upd.message.reply_text(f"📅 {datetime.datetime.now().strftime('%m/%d/%Y')}\n📍 {user_data[uid]['loc']}\n⛽ {gal:.3f} gal (только DIESEL, без DEF)\n💸 Скидка ${disc:.3f}/gal ({pump:.3f} - {app:.3f})\n💰 Экономия ${save:.2f}")
+        await upd.message.reply_text(
+            f"📅 {datetime.datetime.now().strftime('%m/%d/%Y')}\n"
+            f"📍 {user_data[uid]['loc']}\n"
+            f"⛽ {gal:.3f} gal DIESEL (без DEF)\n"
+            f"💸 Скидка ${disc:.3f}/gal ({pump:.3f} - {app:.3f})\n"
+            f"💰 Экономия ${save:.2f}"
+        )
         user_data[uid]={'prices':[], 'gals':[], 'loc':"", 't':0}
     else:
-        await upd.message.reply_text(f"Прочитал: {data} (DEF проигнорирован)\nСобрал: цены {prices} gal {gals}")
+        await upd.message.reply_text(f"Прочитал: {data}\nСобрал уникальные цены: {uniq_prices} gal {gals}\nНужно еще 1 цену. Кинь карту $4.80 или колонку 5.359 отдельно.")
 
 async def photo(u,c):
     try:
@@ -131,5 +159,5 @@ if __name__=="__main__":
     app.add_handler(MessageHandler(filters.PHOTO,photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     app.job_queue.run_daily(weekly_job, time=datetime.time(hour=13, minute=0, second=0), days=(4,))
-    print("v9.1 no DEF started")
+    print("v9.2 started")
     app.run_polling()
