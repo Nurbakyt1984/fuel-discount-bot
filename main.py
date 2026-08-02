@@ -1,4 +1,4 @@
-import os, re, base64, time, datetime, sqlite3, json, traceback, asyncio
+import os, re, base64, datetime, sqlite3, json, asyncio
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -11,7 +11,6 @@ DB = "fuel.db"
 def init_db():
     con=sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS fuel (user_id INTEGER, date TEXT, gallons REAL, disc REAL, saving REAL, loc TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, chat_id INTEGER)")
     con.commit(); con.close()
 
 def add_fuel(uid, gal, disc, save, loc=""):
@@ -21,48 +20,33 @@ def add_fuel(uid, gal, disc, save, loc=""):
 
 async def ask_gpt(b):
     b64=base64.b64encode(b).decode()
-    prompt='''Return ONLY JSON. Find in image:
-- pump_price: LED pump "5.359" -> {"pump_price":5.359}
-- diesel_price: receipt "69.74 at 5.179" -> {"diesel_price":5.179}
-- diesel_gallons: "69.74" -> {"diesel_gallons":69.74}
-- app_price: map green bubble "$4.80" -> {"app_price":4.80}
-- location: "TA Grand Island"
-IGNORE DEF. Only JSON, nothing else.'''
-    try:
-        r=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}], max_tokens=150)
-        txt=r.choices[0].message.content.strip()
-        m=re.search(r'\{.*\}', txt, re.DOTALL)
-        if m: txt=m.group(0)
-        print(f"GPT RAW: {txt}")
-        return json.loads(txt)
-    except Exception as e:
-        return {"error":str(e)}
+    prompt='''Return ONLY JSON. Strict rules:
+- pump_price ONLY if you see LED pump display with "5.359" - if you see only receipt, DO NOT return pump_price
+- diesel_price: from receipt "69.74 gallons at 5.179/gal" -> 5.179
+- diesel_gallons: 69.74
+- app_price: map bubble "$4.80" -> 4.80
+If image is receipt+map collage, return {"diesel_price":5.179,"diesel_gallons":69.74,"app_price":4.80}
+NEVER invent pump_price if no pump photo. Only JSON.'''
+    r=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}}]}], max_tokens=150)
+    txt=r.choices[0].message.content.strip()
+    m=re.search(r'\{.*\}', txt, re.DOTALL)
+    if m: txt=m.group(0)
+    print(f"GPT: {txt}")
+    try: return json.loads(txt)
+    except: return {}
 
 album_buffer={}
 album_lock=asyncio.Lock()
 
-# ЭТО ГЛАВНОЕ - НИЧЕГО НЕ ПОМНИМ МЕЖДУ ЗАПРОСАМИ
-# last_gallons убрал вообще!
-
 async def clear_all(uid, chat_id, context):
-    async with album_lock:
-        album_buffer.clear()
-    await context.bot.send_message(chat_id=chat_id, text="✅ Память полностью очищена! 5.359 удален. Теперь кидай чек+карту заново.")
-
-async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    con=sqlite3.connect(DB)
-    con.execute("INSERT OR REPLACE INTO users VALUES (?,?)", (u.effective_user.id, u.effective_chat.id))
-    con.commit(); con.close()
-    await clear_all(u.effective_user.id, u.effective_chat.id, c)
-
-async def clear_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await clear_all(u.effective_user.id, u.effective_chat.id, c)
+    async with album_lock: album_buffer.clear()
+    await context.bot.send_message(chat_id=chat_id, text="✅ Очищено! Кидай заново чек+карту.")
 
 async def process(uid, chat_id, all_data, context):
     pump=diesel=app=gal=None
     loc="TA Grand Island"
     for d in all_data:
-        if "pump_price" in d:
+        if "pump_price" in d: 
             try: pump=float(str(d["pump_price"]).replace(',','.'))
             except: pass
         if "diesel_price" in d:
@@ -72,31 +56,26 @@ async def process(uid, chat_id, all_data, context):
             try: app=float(str(d["app_price"]).replace(',','.'))
             except: pass
         if "diesel_gallons" in d or "gallons" in d:
-            try:
-                v=d.get("diesel_gallons") or d.get("gallons")
-                gal=float(str(v).replace(',','.'))
+            try: gal=float(str(d.get("diesel_gallons") or d.get("gallons")).replace(',','.'))
             except: pass
-        if "location" in d and d["location"]:
-            loc=d["location"]
+        if "location" in d: loc=d["location"]
 
-    print(f"FINAL COMBINE: pump={pump} diesel={diesel} app={app} gal={gal}")
+    print(f"COMBINE pump={pump} diesel={diesel} app={app} gal={gal}")
 
     if app is None or gal is None:
-        await context.bot.send_message(chat_id=chat_id, text=f"Не вижу карту или галлоны. Нашел: pump={pump} diesel={diesel} app={app} gal={gal}")
         return
 
-    # ТОЛЬКО ТО ЧТО НА ЭТИХ ФОТО - БЕЗ ПАМЯТИ
-    if pump is not None:
-        base=pump
-    else:
+    # ГЛАВНЫЙ ФИКС: если есть чек 5.179 - берем его, а не колонку 5.359
+    if diesel is not None:
         base=diesel
-
-    if base is None:
+        base_label=f"Чек {diesel:.3f}"
+    elif pump is not None:
+        base=pump
+        base_label=f"Колонка {pump:.3f}"
+    else:
         return
 
     disc=base-app
-    if disc < 0.01:
-        return
     save=disc*gal
     add_fuel(uid, gal, disc, save, loc)
 
@@ -104,7 +83,7 @@ async def process(uid, chat_id, all_data, context):
         text=f"📅 {datetime.datetime.now().strftime('%m/%d/%Y')}\n"
              f"📍 {loc}\n"
              f"⛽ {gal:.3f} gal DIESEL (без DEF)\n"
-             f"Цена: {base:.3f}, Карта: {app:.3f}\n"
+             f"{base_label}, Карта: {app:.3f}\n"
              f"💸 Скидка ${disc:.3f}/gal ({base:.3f} - {app:.3f})\n"
              f"💰 Экономия ${save:.2f}")
 
@@ -132,19 +111,16 @@ async def photo(u,c):
         r=await ask_gpt(b)
         await process(uid, u.effective_chat.id, [r], c)
 
-async def text_handler(u,c):
-    txt=(u.message.text or "").lower()
-    if txt.startswith("/clear") or txt.startswith("/Clear"):
-        await clear_all(u.effective_user.id, u.effective_chat.id, c)
+async def start(u,c): await clear_all(u.effective_user.id, u.effective_chat.id, c)
+async def clear_cmd(u,c): await clear_all(u.effective_user.id, u.effective_chat.id, c)
 
 if __name__=="__main__":
     init_db()
     app=ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("clear",clear_cmd))
-    app.add_handler(CommandHandler("Clear",clear_cmd)) # БОЛЬШАЯ БУКВА ТОЖЕ РАБОТАЕТ
+    app.add_handler(CommandHandler("Clear",clear_cmd))
     app.add_handler(MessageHandler(filters.PHOTO,photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(MessageHandler(filters.COMMAND, text_handler)) # ловит /Clear
-    print("v17 NO MEMORY")
+    app.add_handler(MessageHandler(filters.COMMAND, clear_cmd))
+    print("v18 FINAL FIX")
     app.run_polling()
