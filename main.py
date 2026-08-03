@@ -53,4 +53,73 @@ async def album_job(context):
         if "pump_price" in d:
             try:
                 v=float(str(d["pump_price"]).replace(',','.'))
-                if 2.
+                if 2.5<=v<=7.5: 
+                    if "diesel_gallons" in d or "gallons" in d or v<6: # чек
+                        diesel=v; has_receipt=True
+                    if v>5.3 and "pump_price" in d: # колонка
+                        pump=v; has_pump=True
+                    # если только одно значение - считаем и тем и тем
+                    if pump is None: pump=v; has_pump=True
+                    if diesel is None: diesel=v; has_receipt=True
+            except: pass
+        if "diesel_price" in d:
+            try:
+                v=float(str(d["diesel_price"]).replace(',','.'))
+                if 2.5<=v<=7.5: diesel=v; has_receipt=True
+            except: pass
+        if "app_price" in d:
+            try:
+                v=float(str(d["app_price"]).replace(',','.'))
+                if 2.5<=v<=7.5: app=v
+            except: pass
+        for k in ["diesel_gallons","pump_gallons","gallons"]:
+            if k in d:
+                try:
+                    v=float(str(d[k]).replace(',','.'))
+                    if 1<=v<=300: gal=v
+                except: pass
+
+    if gal is None or app is None: return
+    base = diesel if has_receipt and diesel is not None else pump
+    label = f"Чек {base:.3f}" if has_receipt else f"Колонка {base:.3f}"
+    disc=base-app; save=disc*gal
+    add_fuel(uid,gal,disc,save,"TA Grand Island")
+    await context.bot.send_message(chat_id=chat_id,
+        text=f"📅 {datetime.datetime.now(CENTRAL).strftime('%m/%d/%Y')}\n📍 TA Grand Island\n⛽ {gal:.3f} gal DIESEL (без DEF)\n{label}, Карта: {app:.3f}\n💸 Скидка ${disc:.3f}/gal ({base:.3f} - {app:.3f})\n💰 Экономия ${save:.2f}")
+
+async def photo(u,c):
+    uid=u.effective_user.id
+    gid=u.message.media_group_id or f"s_{u.message.message_id}_{uid}"
+    f=await u.message.photo[-1].get_file()
+    b=bytes(await f.download_as_bytearray())
+
+    # ищем есть ли уже job для этого gid, если есть - берем его файлы и добавляем новый
+    existing_jobs=c.job_queue.get_jobs_by_name(f"a{gid}")
+    files=[b]
+    if existing_jobs:
+        # берем файлы из старого job
+        old_files=existing_jobs[0].data.get('files',[])
+        files = old_files + [b]
+        for j in existing_jobs: j.schedule_removal()
+
+    # ставим новый job с объединенными файлами этого КОЛЛАЖА ТОЛЬКО
+    c.job_queue.run_once(album_job, 1.2, data={'gid':gid,'uid':uid,'chat_id':u.effective_chat.id,'files':files}, name=f"a{gid}")
+
+async def start(u,c):
+    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ v31 - каждый коллаж отдельно, без старых")
+async def clear_cmd(u,c):
+    for jobs in c.job_queue.jobs(): 
+        for j in jobs[1]: j.schedule_removal()
+    await c.bot.send_message(chat_id=u.effective_chat.id,text="✅ Очищено")
+async def report_cmd(u,c):
+    (cnt,gal,save),(total_gal,total_save),last_fri,next_fri=get_weekly(u.effective_user.id)
+    await c.bot.send_message(chat_id=u.effective_chat.id,text=f"📊 Пт-Пт {last_fri.strftime('%m/%d')} - {next_fri.strftime('%m/%d')} CT\nВсего: ${total_save:.2f} | {total_gal:.1f} gal\nС {last_fri.strftime('%m/%d')}: {cnt} зап • {gal:.1f} gal • ${save:.2f}")
+
+if __name__=="__main__":
+    init_db()
+    app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("clear",clear_cmd))
+    app.add_handler(CommandHandler("report",report_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO,photo))
+    app.run_polling()
